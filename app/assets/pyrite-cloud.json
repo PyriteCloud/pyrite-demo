@@ -1,0 +1,53 @@
+{
+    "type": "Topology",
+    "objects": {
+        "collection": {
+            "type": "GeometryCollection",
+            "geometries": [
+                {
+                    "type": "Point",
+                    "coordinates": [
+                        -73.8736,
+                        45.3134
+                    ],
+                    "properties": {
+                        "Country": "Canada",
+                        "City": "Beauharnois",
+                        "Region": "us-east-1"
+                    }
+                },
+                {
+                    "type": "Point",
+                    "coordinates": [
+                        8.0778,
+                        50.3847
+                    ],
+                    "properties": {
+                        "Country": "Germany",
+                        "City": "Limburg",
+                        "Region": "eu-central-1"
+                    }
+                },
+                {
+                    "type": "Point",
+                    "coordinates": [
+                        72.8777,
+                        19.076
+                    ],
+                    "properties": {
+                        "Country": "India",
+                        "City": "Mumbai",
+                        "Region": "ap-south-1"
+                    }
+                }
+            ]
+        }
+    },
+    "arcs": [],
+    "bbox": [
+        -73.8736,
+        19.076,
+        72.8777,
+        50.3847
+    ]
+}
