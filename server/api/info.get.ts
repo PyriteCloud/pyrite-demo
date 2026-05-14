@@ -23,7 +23,7 @@ export default defineEventHandler(async (event) => {
     ? PYRITE_REPLICA_NAME
     : `${region}-${Math.floor(Math.random() * 5)}`
 
-  await new Promise(r => setTimeout(r, 1000))
+  await new Promise(r => setTimeout(r, 2000))
 
   return {
     timestamp: Date.now(),
