@@ -9,9 +9,7 @@ import countriesTopology from '@/assets/countries-110m.json'
 import pyriteCloudTopology from '@/assets/pyrite-cloud.json'
 
 const route = useRoute()
-const renderEnabled = computed(() => {
-  return route.query.render !== 'false'
-})
+const renderEnabled = computed(() => route.query.render !== 'false')
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -23,7 +21,6 @@ type NodePoint = {
   colo?: string
   region?: string
   coords: Point
-  /** Pre-projected [x, y] — static, computed once at startup */
   projected: [number, number]
 }
 
@@ -53,6 +50,30 @@ type InfoResponse = {
   cloudflare?: { ray?: string | null, colo?: string | null }
 }
 
+type WorkerResultMessage = {
+  type: 'RESULT'
+  success: boolean
+  data?: InfoResponse
+  latencyMs?: number
+  inflight?: number
+}
+
+type WorkerStateMessage = {
+  type: 'STATE'
+  inflight: number
+  activeLoops: number
+  targetConcurrency: number
+}
+
+type WorkerMessage = WorkerResultMessage | WorkerStateMessage
+
+type WorkerStartMessage = {
+  type: 'START'
+  concurrency: number
+  url: string
+  timeoutMs: number
+}
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const WIDTH = 1400
@@ -60,16 +81,12 @@ const HEIGHT = 720
 
 const TRACE_TTL_MS = 10_000
 const MAX_TRACES = 500
-const MAX_INFLIGHT = 1500
-
 const REQUEST_TIMEOUT_MS = 30_000
 
 const POD_IDLE_MS = 10_000
 const POD_DELETE_MS = 60_000
-/** How often to evict stale pods from the registry (ms). */
 const POD_EVICT_INTERVAL_MS = 5_000
 
-/** Hard cap on trace path cache size. Oldest entries are evicted first. */
 const TRACE_CACHE_MAX = 500
 
 const CLOUDFLARE_PRIMARY = '#F48120'
@@ -122,6 +139,7 @@ function getFeatureName(feature: any) {
 function normalizeColo(v?: string | null) {
   return v?.trim().toUpperCase() ?? ''
 }
+
 function normalizeRegion(v?: string | null) {
   return v?.trim().toLowerCase() ?? ''
 }
@@ -139,10 +157,6 @@ const projection = d3.geoNaturalEarth1().fitSize([WIDTH, HEIGHT], {
 
 const mapPath = d3.geoPath(projection)
 
-/**
- * Build a NodePoint and pre-project its coordinates so the projection
- * function is never called inside the hot render loop.
- */
 function makeNode(
   id: string,
   name: string,
@@ -176,16 +190,13 @@ const pyriteServers: NodePoint[] = toFeatures(pyriteCloudTopology).map(
 const cloudflareByColo = new Map(
   cloudflareServers.filter(s => s.colo).map(s => [s.colo as string, s])
 )
+
 const pyriteByRegion = new Map(
   pyriteServers.filter(s => s.region).map(s => [s.region as string, s])
 )
 
-// ─── Bounded LRU-style trace path cache ──────────────────────────────────────
+// ─── Bounded trace cache ──────────────────────────────────────────────────────
 
-/**
- * Memoises SVG arc paths between node pairs.
- * Evicts the oldest entry once the cap is reached so memory is bounded.
- */
 const traceCache = new Map<
   string,
   { pathD: string, interpolate: (t: number) => Point }
@@ -197,7 +208,6 @@ function getOrBuildTrace(source: NodePoint, target: NodePoint) {
   if (cached) return cached
 
   if (traceCache.size >= TRACE_CACHE_MAX) {
-    // Map preserves insertion order — delete the oldest key
     traceCache.delete(traceCache.keys().next().value!)
   }
 
@@ -217,29 +227,18 @@ function getOrBuildTrace(source: NodePoint, target: NodePoint) {
 // ─── Reactive state ───────────────────────────────────────────────────────────
 
 const svgRef = shallowRef<SVGSVGElement | null>(null)
-const rps = shallowRef(5)
+const concurrency = shallowRef(5)
 
-// Counters
 const totalRequests = shallowRef(0)
 const successRequests = shallowRef(0)
 const errorRequests = shallowRef(0)
 const inflightRequests = shallowRef(0)
 const latencyAvgMs = shallowRef(0)
 
-// Pod registry — use shallowRef; we'll trigger reactivity manually
 const podRegistry = shallowRef<Map<string, PodState>>(new Map())
-
-/**
- * `now` is updated every animation frame so template bindings that depend
- * on the current time (pod idle/active state) stay accurate without
- * calling `Date.now()` from inside `:class` expressions.
- */
 const now = shallowRef(Date.now())
 
-// ─── Computed ─────────────────────────────────────────────────────────────────
-
 const podsByRegion = computed(() => {
-  // Read from the registry snapshot; eviction is done by a separate interval
   const grouped = new Map<string, PodState[]>()
   for (const pod of podRegistry.value.values()) {
     if (!grouped.has(pod.region)) grouped.set(pod.region, [])
@@ -271,13 +270,12 @@ function upsertPod(hostname: string, region: string, success: boolean) {
       requestCount: 1
     })
   }
-  // Trigger computed re-evaluation
+
   podRegistry.value = new Map(registry)
 }
 
 // ─── Live request factory ─────────────────────────────────────────────────────
 
-/** All currently-animated requests. Mutated directly; not reactive. */
 const activeRequests: LiveRequest[] = []
 
 function createLiveRequest(
@@ -289,9 +287,11 @@ function createLiveRequest(
     = response.cloudflare?.colo
       ?? response.cloudflare?.ray?.split('-')?.[1]
       ?? null
+
   const source = cfColo
     ? (cloudflareByColo.get(normalizeColo(cfColo)) ?? null)
     : null
+
   const target = response.pyrite?.region
     ? (pyriteByRegion.get(normalizeRegion(response.pyrite.region)) ?? null)
     : null
@@ -313,7 +313,6 @@ function createLiveRequest(
     success
   }
 
-  // Bounded active list
   activeRequests.push(request)
   if (activeRequests.length > MAX_TRACES) {
     activeRequests.splice(0, activeRequests.length - MAX_TRACES)
@@ -322,77 +321,88 @@ function createLiveRequest(
   upsertPod(request.hostname, request.region, success)
 }
 
-// ─── HTTP polling ─────────────────────────────────────────────────────────────
+// ─── Concurrency generator worker ─────────────────────────────────────────────
 
-let pollingInterval: ReturnType<typeof setInterval> | undefined
-let keepPolling = false
+let loadWorker: Worker | null = null
 
-async function pollInfo() {
-  if (inflightRequests.value >= MAX_INFLIGHT) return
+function initWorker() {
+  if (!import.meta.client) return
+  if (loadWorker) return
 
-  totalRequests.value += 1
-  inflightRequests.value += 1
+  loadWorker = new Worker(
+    new URL('@/assets/workers/load-gen.ts', import.meta.url),
+    { type: 'module' }
+  )
 
-  const startedAt = performance.now()
-  try {
-    const response = await $fetch<InfoResponse>('/api/info', {
-      cache: 'no-store',
-      timeout: REQUEST_TIMEOUT_MS
-    })
+  loadWorker.onmessage = (e: MessageEvent<WorkerMessage>) => {
+    const msg = e.data
 
-    const latencyMs = performance.now() - startedAt
-    successRequests.value += 1
-    // Exponential moving average (α = 0.1)
-    latencyAvgMs.value
-      = latencyAvgMs.value === 0
-        ? latencyMs
-        : latencyAvgMs.value * 0.9 + latencyMs * 0.1
-
-    createLiveRequest(response, latencyMs, true)
-  } catch (err) {
-    errorRequests.value += 1
-    console.error(err)
-  } finally {
-    inflightRequests.value = Math.max(0, inflightRequests.value - 1)
-  }
-}
-
-function restartPolling() {
-  stopPolling()
-
-  if (rps.value <= 0) return
-
-  keepPolling = true
-
-  const TICK_RATE = 10
-  const intervalMs = 1000 / TICK_RATE
-
-  pollingInterval = setInterval(() => {
-    if (!keepPolling) return
-
-    const requestsPerTick = Math.ceil(rps.value / TICK_RATE)
-
-    for (let i = 0; i < requestsPerTick; i++) {
-      void pollInfo()
+    if (msg.type === 'STATE') {
+      inflightRequests.value = msg.inflight
+      return
     }
-  }, intervalMs)
-}
 
-function resetPolling() {
-  rps.value = 5
-  restartPolling()
-}
+    if (msg.type === 'RESULT') {
+      totalRequests.value += 1
+      inflightRequests.value = msg.inflight ?? inflightRequests.value
 
-function stopPolling() {
-  keepPolling = false
+      if (msg.success) {
+        successRequests.value += 1
 
-  if (pollingInterval) {
-    clearInterval(pollingInterval)
-    pollingInterval = undefined
+        const latencyMs = msg.latencyMs ?? 0
+        latencyAvgMs.value
+          = latencyAvgMs.value === 0
+            ? latencyMs
+            : latencyAvgMs.value * 0.9 + latencyMs * 0.1
+
+        if (renderEnabled.value && msg.data) {
+          createLiveRequest(msg.data, latencyMs, true)
+        }
+      } else {
+        errorRequests.value += 1
+      }
+    }
   }
 }
 
-// ─── Packet color helper (pure function, no closure) ─────────────────────────
+function restartGenerator() {
+  if (!import.meta.client) return
+
+  if (loadWorker) {
+    loadWorker.terminate()
+    loadWorker = null
+  }
+
+  initWorker()
+
+  const target = Math.max(0, Math.floor(concurrency.value))
+  if (!loadWorker || target <= 0) {
+    inflightRequests.value = 0
+    return
+  }
+
+  loadWorker.postMessage({
+    type: 'START',
+    concurrency: target,
+    url: '/api/info',
+    timeoutMs: REQUEST_TIMEOUT_MS
+  } satisfies WorkerStartMessage)
+}
+
+function resetGenerator() {
+  concurrency.value = 5
+  restartGenerator()
+}
+
+function stopGenerator() {
+  if (loadWorker) {
+    loadWorker.terminate()
+    loadWorker = null
+  }
+  inflightRequests.value = 0
+}
+
+// ─── Packet color helper ─────────────────────────────────────────────────────
 
 function packetColor(latencyMs: number, success: boolean) {
   if (!success) return '#ef4444'
@@ -407,84 +417,76 @@ let animationFrame = 0
 let evictInterval: ReturnType<typeof setInterval> | undefined
 
 onMounted(() => {
-  // ── Build static SVG layers ──────────────────────────────────────────────
+  if (renderEnabled.value && svgRef.value) {
+    const svg = d3.select(svgRef.value)
+    svg.selectAll('*').remove()
+    svg.attr('viewBox', `0 0 ${WIDTH} ${HEIGHT}`)
 
-  const svg = d3.select(svgRef.value)
-  svg.selectAll('*').remove()
-  svg.attr('viewBox', `0 0 ${WIDTH} ${HEIGHT}`)
+    const mapLayer = svg.append('g')
+    const traceLayer = svg.append('g')
+    const packetLayer = svg.append('g')
+    const cloudflareLayer = svg.append('g')
+    const pyriteLayer = svg.append('g')
 
-  const mapLayer = svg.append('g')
-  const traceLayer = svg.append('g')
-  const packetLayer = svg.append('g')
-  const cloudflareLayer = svg.append('g')
-  const pyriteLayer = svg.append('g')
+    mapLayer
+      .selectAll('path')
+      .data(countries)
+      .enter()
+      .append('path')
+      .attr('d', mapPath as any)
+      .attr('fill', '#111827')
+      .attr('stroke', '#1f2937')
+      .attr('stroke-width', 0.75)
 
-  // Countries
-  mapLayer
-    .selectAll('path')
-    .data(countries)
-    .enter()
-    .append('path')
-    .attr('d', mapPath as any)
-    .attr('fill', '#111827')
-    .attr('stroke', '#1f2937')
-    .attr('stroke-width', 0.75)
+    const cfNodes = cloudflareLayer
+      .selectAll('circle')
+      .data(cloudflareServers)
+      .enter()
+      .append('circle')
+      .attr('cx', d => d.projected[0])
+      .attr('cy', d => d.projected[1])
+      .attr('r', 3)
+      .attr('fill', CLOUDFLARE_PRIMARY)
+      .attr('stroke', CLOUDFLARE_SECONDARY)
+      .attr('stroke-width', 1)
+      .attr('opacity', 0.85)
+    cfNodes.append('title').text(d => `${d.colo}\n${d.name}`)
 
-  // Cloudflare nodes — use pre-projected coords to skip projection in data join
-  const cfNodes = cloudflareLayer
-    .selectAll('circle')
-    .data(cloudflareServers)
-    .enter()
-    .append('circle')
-    .attr('cx', d => d.projected[0])
-    .attr('cy', d => d.projected[1])
-    .attr('r', 3)
-    .attr('fill', CLOUDFLARE_PRIMARY)
-    .attr('stroke', CLOUDFLARE_SECONDARY)
-    .attr('stroke-width', 1)
-    .attr('opacity', 0.85)
-  cfNodes.append('title').text(d => `${d.colo}\n${d.name}`)
+    const pyNodes = pyriteLayer
+      .selectAll('circle')
+      .data(pyriteServers)
+      .enter()
+      .append('circle')
+      .attr('cx', d => d.projected[0])
+      .attr('cy', d => d.projected[1])
+      .attr('r', 6)
+      .attr('fill', PYRITE_PRIMARY)
+      .attr('stroke', PYRITE_SECONDARY)
+      .attr('stroke-width', 1.5)
+    pyNodes.append('title').text(d => `${d.region}\n${d.name}`)
 
-  // Pyrite nodes
-  const pyNodes = pyriteLayer
-    .selectAll('circle')
-    .data(pyriteServers)
-    .enter()
-    .append('circle')
-    .attr('cx', d => d.projected[0])
-    .attr('cy', d => d.projected[1])
-    .attr('r', 6)
-    .attr('fill', PYRITE_PRIMARY)
-    .attr('stroke', PYRITE_SECONDARY)
-    .attr('stroke-width', 1.5)
-  pyNodes.append('title').text(d => `${d.region}\n${d.name}`)
+    pyriteLayer
+      .selectAll('text')
+      .data(pyriteServers)
+      .enter()
+      .append('text')
+      .attr('x', d => d.projected[0] + 10)
+      .attr('y', d => d.projected[1] + 4)
+      .text(d => d.region ?? d.name)
+      .attr('fill', '#ffffff')
+      .attr('font-size', 11)
+      .attr('paint-order', 'stroke')
+      .attr('stroke', '#020617')
+      .attr('stroke-width', 3)
 
-  pyriteLayer
-    .selectAll('text')
-    .data(pyriteServers)
-    .enter()
-    .append('text')
-    .attr('x', d => d.projected[0] + 10)
-    .attr('y', d => d.projected[1] + 4)
-    .text(d => d.region ?? d.name)
-    .attr('fill', '#ffffff')
-    .attr('font-size', 11)
-    .attr('paint-order', 'stroke')
-    .attr('stroke', '#020617')
-    .attr('stroke-width', 3)
+    const render = () => {
+      const ts = Date.now()
+      now.value = ts
 
-  // ── Animation loop ───────────────────────────────────────────────────────
+      const active = activeRequests.filter(
+        d => ts - d.createdAt < TRACE_TTL_MS
+      )
 
-  const render = () => {
-    const ts = Date.now()
-    now.value = ts // drives template bindings that depend on current time
-
-    const active = activeRequests.filter(
-      d => ts - d.createdAt < TRACE_TTL_MS
-    )
-
-    if (renderEnabled.value) {
-      // Trace arcs
       traceLayer
         .selectAll<SVGPathElement, LiveRequest>('path')
         .data(active, d => d.id)
@@ -504,7 +506,6 @@ onMounted(() => {
           Math.max(0, 1 - (ts - d.createdAt) / TRACE_TTL_MS)
         )
 
-      // Animated diamond packets — use pre-projected coordinates inside transform
       packetLayer
         .selectAll<SVGPathElement, LiveRequest>('path')
         .data(active, d => d.id)
@@ -525,33 +526,34 @@ onMounted(() => {
           const proj = projection(geoPoint)
           return proj ? `translate(${proj[0]},${proj[1]}) rotate(45)` : ''
         })
+
+      animationFrame = requestAnimationFrame(render)
     }
-    animationFrame = requestAnimationFrame(render)
+
+    render()
   }
-
-  render()
-
-  // ── Pod eviction (moved out of computed) ─────────────────────────────────
 
   evictInterval = setInterval(() => {
     const ts = Date.now()
     const registry = podRegistry.value
     let changed = false
+
     for (const [hostname, pod] of registry.entries()) {
       if (ts - pod.lastSeenAt > POD_DELETE_MS) {
         registry.delete(hostname)
         changed = true
       }
     }
+
     if (changed) podRegistry.value = new Map(registry)
   }, POD_EVICT_INTERVAL_MS)
 
-  restartPolling()
+  restartGenerator()
 })
 
 onBeforeUnmount(() => {
-  stopPolling()
-  cancelAnimationFrame(animationFrame)
+  stopGenerator()
+  if (animationFrame) cancelAnimationFrame(animationFrame)
   if (evictInterval) clearInterval(evictInterval)
 })
 </script>
@@ -612,10 +614,10 @@ onBeforeUnmount(() => {
           <div class="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
             <div>
               <div class="text-sm font-medium text-white">
-                Requests Per Second
+                Target Concurrency
               </div>
               <div class="text-xs text-neutral-400">
-                Adjust the slider to change the rate
+                Adjust the slider to change the number of active request loops
               </div>
             </div>
             <UBadge
@@ -623,23 +625,25 @@ onBeforeUnmount(() => {
               variant="soft"
               size="lg"
             >
-              {{ rps }} RPS
+              {{ concurrency }} loops
             </UBadge>
           </div>
+
           <div class="mt-5 space-y-4">
             <USlider
-              v-model="rps"
+              v-model="concurrency"
               :min="0"
-              :max="250"
+              :max="1000"
               :step="25"
-              @update:model-value="restartPolling"
+              @update:model-value="restartGenerator"
             />
+
             <div class="flex justify-end gap-2">
               <UButton
                 color="neutral"
                 variant="solid"
                 size="md"
-                @click="resetPolling"
+                @click="resetGenerator"
               >
                 Reset
               </UButton>
@@ -647,7 +651,7 @@ onBeforeUnmount(() => {
                 color="error"
                 variant="solid"
                 size="md"
-                @click="stopPolling"
+                @click="stopGenerator"
               >
                 Stop
               </UButton>
@@ -656,124 +660,124 @@ onBeforeUnmount(() => {
         </UCard>
       </div>
 
-      <!-- ── Pod registry ── -->
-      <UCard class="border-white/10 bg-black">
-        <template #header>
-          <div class="flex items-start justify-between gap-4">
-            <div>
-              <div class="text-sm font-semibold text-white">
-                Replicas
-              </div>
-              <div class="text-xs text-neutral-400">
-                Live pod visualization
-              </div>
-              <div class="mt-2 flex flex-wrap gap-3 text-[11px] text-neutral-400">
-                <div class="flex items-center gap-1">
-                  <span class="h-2 w-2 rounded-full bg-success" /> Healthy
+      <!-- ── Optional visualizations ── -->
+      <template v-if="renderEnabled">
+        <UCard class="border-white/10 bg-black">
+          <template #header>
+            <div class="flex items-start justify-between gap-4">
+              <div>
+                <div class="text-sm font-semibold text-white">
+                  Replicas
                 </div>
-                <div class="flex items-center gap-1">
-                  <span class="h-2 w-2 rounded-full bg-error" /> Error
+                <div class="text-xs text-neutral-400">
+                  Live pod visualization
                 </div>
-                <div class="flex items-center gap-1">
-                  <span class="h-2 w-2 rounded-full bg-gray-500" /> Idle
-                </div>
-              </div>
-            </div>
-            <UBadge
-              color="neutral"
-              variant="soft"
-            >
-              {{ podsByRegion.length }} Regions
-            </UBadge>
-          </div>
-        </template>
-
-        <div class="flex flex-wrap gap-4 overflow-x-auto pb-2">
-          <div
-            v-for="group in podsByRegion"
-            :key="group.region"
-            class="min-w-[260px] shrink-0 rounded-2xl border border-white/10 bg-white/[0.03] p-4"
-          >
-            <div class="mb-4 flex items-center justify-between">
-              <div class="flex items-center gap-2">
-                <div class="h-2 w-2 rounded-full bg-violet-400" />
-                <div class="text-sm font-medium text-white">
-                  {{ group.region }}
+                <div class="mt-2 flex flex-wrap gap-3 text-[11px] text-neutral-400">
+                  <div class="flex items-center gap-1">
+                    <span class="h-2 w-2 rounded-full bg-success" /> Healthy
+                  </div>
+                  <div class="flex items-center gap-1">
+                    <span class="h-2 w-2 rounded-full bg-error" /> Error
+                  </div>
+                  <div class="flex items-center gap-1">
+                    <span class="h-2 w-2 rounded-full bg-gray-500" /> Idle
+                  </div>
                 </div>
               </div>
               <UBadge
-                size="sm"
                 color="neutral"
                 variant="soft"
               >
-                {{ group.pods.length }}
+                {{ podsByRegion.length }} Regions
               </UBadge>
             </div>
+          </template>
 
-            <TransitionGroup
-              name="pod"
-              tag="div"
-              class="flex flex-wrap gap-2"
+          <div class="flex flex-wrap gap-4 overflow-x-auto pb-2">
+            <div
+              v-for="group in podsByRegion"
+              :key="group.region"
+              class="min-w-[260px] shrink-0 rounded-2xl border border-white/10 bg-white/[0.03] p-4"
             >
-              <div
-                v-for="pod in group.pods"
-                :key="pod.hostname"
-                class="group relative"
-              >
-                <UTooltip :text="`${pod.hostname} · ${pod.requestCount} req`">
-                  <div
-                    :class="[
-                      'flex aspect-square h-14 flex-col items-center justify-center rounded-xl border text-[10px] font-medium transition-all duration-500 ease-out animate-in fade-in zoom-in-50',
-                      now - pod.lastSeenAt > POD_IDLE_MS
-                        ? 'border-white/10 bg-gray-500/20 text-gray-500 opacity-40'
-                        : pod.lastStatus === 'success'
-                          ? 'border-success/30 bg-success/20 text-success shadow-lg shadow-success/10'
-                          : 'border-error/30 bg-error/20 text-error shadow-lg shadow-error/10'
-                    ]"
-                  >
-                    <span>{{ pod.hostname.split('-').slice(-1)[0] }}</span>
-                    <!-- Use reactive `now` instead of calling Date.now() in template -->
-                    <span class="mt-1 text-[9px] opacity-70">
-                      {{ Math.floor((now - pod.lastSeenAt) / 1000) }}s
-                    </span>
+              <div class="mb-4 flex items-center justify-between">
+                <div class="flex items-center gap-2">
+                  <div class="h-2 w-2 rounded-full bg-violet-400" />
+                  <div class="text-sm font-medium text-white">
+                    {{ group.region }}
                   </div>
-                </UTooltip>
+                </div>
+                <UBadge
+                  size="sm"
+                  color="neutral"
+                  variant="soft"
+                >
+                  {{ group.pods.length }}
+                </UBadge>
               </div>
-            </TransitionGroup>
-          </div>
-        </div>
-      </UCard>
 
-      <!-- ── World map ── -->
-      <UCard class="overflow-hidden border-white/10 bg-black">
-        <template #header>
-          <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-            <div>
-              <div class="text-sm font-semibold text-white">
-                Global Request Flow
+              <TransitionGroup
+                name="pod"
+                tag="div"
+                class="flex flex-wrap gap-2"
+              >
+                <div
+                  v-for="pod in group.pods"
+                  :key="pod.hostname"
+                  class="group relative"
+                >
+                  <UTooltip :text="`${pod.hostname} · ${pod.requestCount} req`">
+                    <div
+                      :class="[
+                        'flex aspect-square h-14 flex-col items-center justify-center rounded-xl border text-[10px] font-medium transition-all duration-500 ease-out animate-in fade-in zoom-in-50',
+                        now - pod.lastSeenAt > POD_IDLE_MS
+                          ? 'border-white/10 bg-gray-500/20 text-gray-500 opacity-40'
+                          : pod.lastStatus === 'success'
+                            ? 'border-success/30 bg-success/20 text-success shadow-lg shadow-success/10'
+                            : 'border-error/30 bg-error/20 text-error shadow-lg shadow-error/10'
+                      ]"
+                    >
+                      <span>{{ pod.hostname.split('-').slice(-1)[0] }}</span>
+                      <span class="mt-1 text-[9px] opacity-70">
+                        {{ Math.floor((now - pod.lastSeenAt) / 1000) }}s
+                      </span>
+                    </div>
+                  </UTooltip>
+                </div>
+              </TransitionGroup>
+            </div>
+          </div>
+        </UCard>
+
+        <UCard class="overflow-hidden border-white/10 bg-black">
+          <template #header>
+            <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <div class="text-sm font-semibold text-white">
+                  Global Request Flow
+                </div>
+                <div class="text-xs text-neutral-400">
+                  Cloudflare → Pyrite Cloud
+                </div>
               </div>
-              <div class="text-xs text-neutral-400">
-                Cloudflare → Pyrite Cloud
+              <div class="flex items-center gap-2 text-xs text-neutral-400">
+                <div class="flex items-center gap-1">
+                  <span class="h-2 w-2 rounded-full bg-[#F48120]" /> Cloudflare
+                </div>
+                <div class="flex items-center gap-1">
+                  <span class="h-2 w-2 rounded-full bg-[#43E8D8]" /> Pyrite Cloud
+                </div>
               </div>
             </div>
-            <div class="flex items-center gap-2 text-xs text-neutral-400">
-              <div class="flex items-center gap-1">
-                <span class="h-2 w-2 rounded-full bg-[#F48120]" /> Cloudflare
-              </div>
-              <div class="flex items-center gap-1">
-                <span class="h-2 w-2 rounded-full bg-[#43E8D8]" /> Pyrite Cloud
-              </div>
-            </div>
-          </div>
-        </template>
+          </template>
 
-        <div class="relative h-[55vh] min-h-[420px] w-full sm:h-[65vh] xl:h-[72vh]">
-          <svg
-            ref="svgRef"
-            class="h-full w-full bg-black"
-          />
-        </div>
-      </UCard>
+          <div class="relative h-[55vh] min-h-[420px] w-full sm:h-[65vh] xl:h-[72vh]">
+            <svg
+              ref="svgRef"
+              class="h-full w-full bg-black"
+            />
+          </div>
+        </UCard>
+      </template>
     </div>
   </UContainer>
 </template>
