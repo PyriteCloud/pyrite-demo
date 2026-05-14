@@ -7,7 +7,7 @@ const PYRITE_REPLICA_NAME = process.env.PYRITE_REPLICA_NAME ?? null
 
 const isProd = process.env.NODE_ENV === 'production'
 
-export default defineEventHandler((event) => {
+export default defineEventHandler(async (event) => {
   setHeader(event, 'Cache-Control', 'no-store')
   setHeader(event, 'Connection', 'close')
 
@@ -22,6 +22,8 @@ export default defineEventHandler((event) => {
   const hostname = isProd
     ? PYRITE_REPLICA_NAME
     : `${region}-${Math.floor(Math.random() * 5)}`
+
+  await new Promise(r => setTimeout(r, 100))
 
   return {
     timestamp: Date.now(),

@@ -57,7 +57,7 @@ const TRACE_TTL_MS = 10_000
 const MAX_TRACES = 500
 const MAX_LATEST = 20
 
-const REQUEST_TIMEOUT_MS = 1_000
+const REQUEST_TIMEOUT_MS = 30_000
 
 const POD_IDLE_MS = 10_000
 const POD_DELETE_MS = 60_000
@@ -337,7 +337,7 @@ async function pollInfo() {
 
   const startedAt = performance.now()
   try {
-    const response = await $fetch<InfoResponse>('/info', {
+    const response = await $fetch<InfoResponse>('/api/info', {
       cache: 'no-store',
       timeout: REQUEST_TIMEOUT_MS
     })
@@ -385,13 +385,6 @@ function stopPolling() {
 // ─── Packet color helper (pure function, no closure) ─────────────────────────
 
 function packetColor(latencyMs: number, success: boolean) {
-  if (!success) return '#ef4444'
-  if (latencyMs < 120) return '#22c55e'
-  if (latencyMs < 300) return '#f59e0b'
-  return PYRITE_PRIMARY
-}
-
-function traceColor(latencyMs: number, success: boolean) {
   if (!success) return '#ef4444'
   if (latencyMs < 120) return '#22c55e'
   if (latencyMs < 300) return '#f59e0b'
@@ -495,7 +488,7 @@ onMounted(() => {
         exit => exit.remove()
       )
       .attr('d', d => d.pathD)
-      .attr('stroke', d => traceColor(d.latencyMs, d.success))
+      .attr('stroke', d => packetColor(d.latencyMs, d.success))
       .attr('opacity', d =>
         Math.max(0, 1 - (ts - d.createdAt) / TRACE_TTL_MS)
       )
