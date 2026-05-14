@@ -55,7 +55,7 @@ const HEIGHT = 720
 
 const TRACE_TTL_MS = 10_000
 const MAX_TRACES = 500
-const MAX_LATEST = 20
+const MAX_INFLIGHT = 1000
 
 const REQUEST_TIMEOUT_MS = 30_000
 
@@ -221,9 +221,6 @@ const errorRequests = shallowRef(0)
 const inflightRequests = shallowRef(0)
 const latencyAvgMs = shallowRef(0)
 
-// Latest request list (fixed size, no expensive unshift+slice every tick)
-const latestRequests = shallowRef<LiveRequest[]>([])
-
 // Pod registry — use shallowRef; we'll trigger reactivity manually
 const podRegistry = shallowRef<Map<string, PodState>>(new Map())
 
@@ -317,21 +314,17 @@ function createLiveRequest(
     activeRequests.splice(0, activeRequests.length - MAX_TRACES)
   }
 
-  // Prepend to latest list without repeated array allocation
-  const latest = latestRequests.value
-  latest.unshift(request)
-  if (latest.length > MAX_LATEST) latest.length = MAX_LATEST
-  latestRequests.value = latest // trigger reactivity
-
   upsertPod(request.hostname, request.region, success)
 }
 
 // ─── HTTP polling ─────────────────────────────────────────────────────────────
 
-let pollingTimer: ReturnType<typeof setTimeout> | undefined
+let pollingInterval: ReturnType<typeof setInterval> | undefined
 let keepPolling = false
 
 async function pollInfo() {
+  if (inflightRequests.value >= MAX_INFLIGHT) return
+
   totalRequests.value += 1
   inflightRequests.value += 1
 
@@ -361,15 +354,23 @@ async function pollInfo() {
 
 function restartPolling() {
   stopPolling()
-  if (rps.value === 0) return
+
+  if (rps.value <= 0) return
+
   keepPolling = true
-  const intervalMs = Math.max(15, Math.floor(1_000 / rps.value))
-  const tick = () => {
+
+  const TICK_RATE = 10
+  const intervalMs = 1000 / TICK_RATE
+
+  pollingInterval = setInterval(() => {
     if (!keepPolling) return
-    void pollInfo()
-    pollingTimer = setTimeout(tick, intervalMs)
-  }
-  tick()
+
+    const requestsPerTick = Math.ceil(rps.value / TICK_RATE)
+
+    for (let i = 0; i < requestsPerTick; i++) {
+      void pollInfo()
+    }
+  }, intervalMs)
 }
 
 function resetPolling() {
@@ -379,7 +380,11 @@ function resetPolling() {
 
 function stopPolling() {
   keepPolling = false
-  if (pollingTimer) clearTimeout(pollingTimer)
+
+  if (pollingInterval) {
+    clearInterval(pollingInterval)
+    pollingInterval = undefined
+  }
 }
 
 // ─── Packet color helper (pure function, no closure) ─────────────────────────
