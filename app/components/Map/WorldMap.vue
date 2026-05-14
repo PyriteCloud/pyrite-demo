@@ -8,6 +8,11 @@ import cloudflareTopology from '@/assets/cloudflare.json'
 import countriesTopology from '@/assets/countries-110m.json'
 import pyriteCloudTopology from '@/assets/pyrite-cloud.json'
 
+const route = useRoute()
+const renderEnabled = computed(() => {
+  return route.query.render !== 'false'
+})
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 type Point = [number, number]
@@ -55,7 +60,7 @@ const HEIGHT = 720
 
 const TRACE_TTL_MS = 10_000
 const MAX_TRACES = 500
-const MAX_INFLIGHT = 1000
+const MAX_INFLIGHT = 1500
 
 const REQUEST_TIMEOUT_MS = 30_000
 
@@ -478,45 +483,49 @@ onMounted(() => {
       d => ts - d.createdAt < TRACE_TTL_MS
     )
 
-    // Trace arcs
-    traceLayer
-      .selectAll<SVGPathElement, LiveRequest>('path')
-      .data(active, d => d.id)
-      .join(
-        enter =>
-          enter
-            .append('path')
-            .attr('fill', 'none')
-            .attr('stroke-width', 2)
-            .attr('stroke-linecap', 'round'),
-        update => update,
-        exit => exit.remove()
-      )
-      .attr('d', d => d.pathD)
-      .attr('stroke', d => packetColor(d.latencyMs, d.success))
-      .attr('opacity', d =>
-        Math.max(0, 1 - (ts - d.createdAt) / TRACE_TTL_MS)
-      )
+    if (renderEnabled.value) {
+      // Trace arcs
+      traceLayer
+        .selectAll<SVGPathElement, LiveRequest>('path')
+        .data(active, d => d.id)
+        .join(
+          enter =>
+            enter
+              .append('path')
+              .attr('fill', 'none')
+              .attr('stroke-width', 2)
+              .attr('stroke-linecap', 'round'),
+          update => update,
+          exit => exit.remove()
+        )
+        .attr('d', d => d.pathD)
+        .attr('stroke', d => packetColor(d.latencyMs, d.success))
+        .attr('opacity', d =>
+          Math.max(0, 1 - (ts - d.createdAt) / TRACE_TTL_MS)
+        )
 
-    // Animated diamond packets — use pre-projected coordinates inside transform
-    packetLayer
-      .selectAll<SVGPathElement, LiveRequest>('path')
-      .data(active, d => d.id)
-      .join(
-        enter =>
-          enter.append('path').attr('d', PACKET_DIAMOND).attr('opacity', 0.95),
-        update => update,
-        exit => exit.remove()
-      )
-      .attr('fill', d => packetColor(d.latencyMs, d.success))
-      .attr('filter', 'drop-shadow(0 0 2px rgba(255,255,255,0.25))')
-      .attr('transform', (d) => {
-        const progress = Math.min((ts - d.createdAt) / TRACE_TTL_MS, 1)
-        const geoPoint = d.interpolate(progress)
-        const proj = projection(geoPoint)
-        return proj ? `translate(${proj[0]},${proj[1]}) rotate(45)` : ''
-      })
-
+      // Animated diamond packets — use pre-projected coordinates inside transform
+      packetLayer
+        .selectAll<SVGPathElement, LiveRequest>('path')
+        .data(active, d => d.id)
+        .join(
+          enter =>
+            enter
+              .append('path')
+              .attr('d', PACKET_DIAMOND)
+              .attr('opacity', 0.95),
+          update => update,
+          exit => exit.remove()
+        )
+        .attr('fill', d => packetColor(d.latencyMs, d.success))
+        .attr('filter', 'drop-shadow(0 0 2px rgba(255,255,255,0.25))')
+        .attr('transform', (d) => {
+          const progress = Math.min((ts - d.createdAt) / TRACE_TTL_MS, 1)
+          const geoPoint = d.interpolate(progress)
+          const proj = projection(geoPoint)
+          return proj ? `translate(${proj[0]},${proj[1]}) rotate(45)` : ''
+        })
+    }
     animationFrame = requestAnimationFrame(render)
   }
 
@@ -622,7 +631,7 @@ onBeforeUnmount(() => {
               v-model="rps"
               :min="0"
               :max="250"
-              :step="5"
+              :step="25"
               @update:model-value="restartPolling"
             />
             <div class="flex justify-end gap-2">
