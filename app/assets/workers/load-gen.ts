@@ -1,8 +1,14 @@
+// ─── Message types ────────────────────────────────────────────────────────────
+
 type StartMessage = {
   type: 'START'
   concurrency: number
   url: string
   timeoutMs: number
+}
+
+type StopMessage = {
+  type: 'STOP'
 }
 
 type ResultMessage = {
@@ -20,9 +26,14 @@ type StateMessage = {
   targetConcurrency: number
 }
 
-type WorkerMessage = StartMessage | ResultMessage | StateMessage
+type WorkerInMessage = StartMessage | StopMessage
+
+// ─── State ────────────────────────────────────────────────────────────────────
 
 let activeLoops = 0
+let runController: AbortController | null = null
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function postState(targetConcurrency: number) {
   self.postMessage({
@@ -33,18 +44,31 @@ function postState(targetConcurrency: number) {
   } satisfies StateMessage)
 }
 
-async function requestLoop(url: string, timeoutMs: number) {
-  activeLoops += 1
+function stopAllLoops() {
+  runController?.abort()
+  runController = null
+  activeLoops = 0
+}
+
+// ─── Request loop ─────────────────────────────────────────────────────────────
+
+async function requestLoop(
+  url: string,
+  timeoutMs: number,
+  signal: AbortSignal
+) {
+  activeLoops++
 
   try {
-    while (true) {
+    while (!signal.aborted) {
       const startedAt = performance.now()
 
       try {
-        const response = await fetch(url, {
+        const urlWithTimestamp = `${url}?t=${Date.now() + Math.random()}`
+        const response = await fetch(urlWithTimestamp, {
           cache: 'no-store',
           keepalive: true,
-          signal: AbortSignal.timeout(timeoutMs)
+          signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
         })
 
         const latencyMs = performance.now() - startedAt
@@ -64,6 +88,8 @@ async function requestLoop(url: string, timeoutMs: number) {
           inflight: activeLoops
         } satisfies ResultMessage)
       } catch {
+        if (signal.aborted) break
+
         self.postMessage({
           type: 'RESULT',
           success: false,
@@ -76,20 +102,34 @@ async function requestLoop(url: string, timeoutMs: number) {
   }
 }
 
-self.onmessage = (e: MessageEvent<WorkerMessage>) => {
+// ─── Message handler ──────────────────────────────────────────────────────────
+
+self.onmessage = (e: MessageEvent<WorkerInMessage>) => {
   const msg = e.data
 
-  if (msg.type !== 'START') return
-
-  const concurrency = Math.max(0, Math.floor(msg.concurrency))
-  if (concurrency <= 0) {
-    activeLoops = 0
+  if (msg.type === 'STOP') {
+    stopAllLoops()
     postState(0)
     return
   }
 
+  if (msg.type !== 'START') return
+
+  // Cancel any loops from the previous run before starting fresh
+  stopAllLoops()
+
+  const concurrency = Math.max(0, Math.floor(msg.concurrency))
+
+  if (concurrency === 0) {
+    postState(0)
+    return
+  }
+
+  runController = new AbortController()
+  const { signal } = runController
+
   for (let i = 0; i < concurrency; i++) {
-    void requestLoop(msg.url, msg.timeoutMs)
+    void requestLoop(msg.url, msg.timeoutMs, signal)
   }
 
   postState(concurrency)

@@ -74,6 +74,10 @@ type WorkerStartMessage = {
   timeoutMs: number
 }
 
+type WorkerStopMessage = {
+  type: 'STOP'
+}
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const WIDTH = 1400
@@ -321,13 +325,12 @@ function createLiveRequest(
   upsertPod(request.hostname, request.region, success)
 }
 
-// ─── Concurrency generator worker ─────────────────────────────────────────────
+// ─── Worker management ────────────────────────────────────────────────────────
 
 let loadWorker: Worker | null = null
 
-function initWorker() {
-  if (!import.meta.client) return
-  if (loadWorker) return
+function getOrInitWorker(): Worker {
+  if (loadWorker) return loadWorker
 
   loadWorker = new Worker(
     new URL('@/assets/workers/load-gen.ts', import.meta.url),
@@ -363,25 +366,23 @@ function initWorker() {
       }
     }
   }
+
+  return loadWorker
 }
 
 function restartGenerator() {
   if (!import.meta.client) return
 
-  if (loadWorker) {
-    loadWorker.terminate()
-    loadWorker = null
-  }
-
-  initWorker()
-
   const target = Math.max(0, Math.floor(concurrency.value))
-  if (!loadWorker || target <= 0) {
+
+  if (target === 0) {
+    // Send STOP without tearing down the worker
+    loadWorker?.postMessage({ type: 'STOP' } satisfies WorkerStopMessage)
     inflightRequests.value = 0
     return
   }
 
-  loadWorker.postMessage({
+  getOrInitWorker().postMessage({
     type: 'START',
     concurrency: target,
     url: '/api/info',
@@ -395,10 +396,14 @@ function resetGenerator() {
 }
 
 function stopGenerator() {
-  if (loadWorker) {
-    loadWorker.terminate()
-    loadWorker = null
-  }
+  // Pause loops via message — keeps the worker alive for a quick resume
+  loadWorker?.postMessage({ type: 'STOP' } satisfies WorkerStopMessage)
+  inflightRequests.value = 0
+}
+
+function terminateWorker() {
+  loadWorker?.terminate()
+  loadWorker = null
   inflightRequests.value = 0
 }
 
@@ -552,7 +557,7 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
-  stopGenerator()
+  terminateWorker()
   if (animationFrame) cancelAnimationFrame(animationFrame)
   if (evictInterval) clearInterval(evictInterval)
 })
@@ -633,7 +638,7 @@ onBeforeUnmount(() => {
             <USlider
               v-model="concurrency"
               :min="0"
-              :max="1000"
+              :max="250"
               :step="25"
               @update:model-value="restartGenerator"
             />
